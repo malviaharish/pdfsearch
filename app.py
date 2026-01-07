@@ -1,12 +1,33 @@
 import os
 import sqlite3
-import fitz
-import pytesseract
-from pdf2image import convert_from_path
-from sentence_transformers import SentenceTransformer
-import faiss
 import numpy as np
 import streamlit as st
+
+# ---------------- ENV DETECTION ---------------- #
+
+IS_STREAMLIT_CLOUD = os.environ.get("STREAMLIT_RUNTIME") == "cloud"
+
+# ---------------- SAFE IMPORTS ---------------- #
+
+try:
+    import fitz  # PyMuPDF
+except Exception as e:
+    st.error("PyMuPDF (fitz) not available. Check pymupdf installation.")
+    st.stop()
+
+# OCR imports only if local
+if not IS_STREAMLIT_CLOUD:
+    try:
+        import pytesseract
+        from pdf2image import convert_from_path
+        OCR_AVAILABLE = True
+    except Exception:
+        OCR_AVAILABLE = False
+else:
+    OCR_AVAILABLE = False
+
+from sentence_transformers import SentenceTransformer
+import faiss
 
 # ---------------- CONFIG ---------------- #
 
@@ -14,7 +35,18 @@ DB = "pdf_index.db"
 HIGHLIGHT_DIR = "highlighted"
 os.makedirs(HIGHLIGHT_DIR, exist_ok=True)
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+st.set_page_config(
+    page_title="Local PDF Search Engine",
+    layout="wide"
+)
+
+# ---------------- MODELS ---------------- #
+
+@st.cache_resource
+def load_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+model = load_model()
 
 # ---------------- DATABASE ---------------- #
 
@@ -32,34 +64,43 @@ def init_db():
     conn.close()
 
 def store_page(file, page, text):
+    if not text.strip():
+        return
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("INSERT INTO pdf_index VALUES (?, ?, ?)",
-                (file, page, text))
+    cur.execute(
+        "INSERT INTO pdf_index VALUES (?, ?, ?)",
+        (file, page, text)
+    )
     conn.commit()
     conn.close()
 
 # ---------------- OCR ---------------- #
 
 def ocr_pdf(pdf_path):
-    text_pages = []
+    pages = []
     images = convert_from_path(pdf_path)
     for i, img in enumerate(images):
         text = pytesseract.image_to_string(img)
-        text_pages.append((i + 1, text))
-    return text_pages
+        pages.append((i + 1, text))
+    return pages
 
 # ---------------- PDF PROCESSING ---------------- #
 
 def process_pdf(pdf_path):
     doc = fitz.open(pdf_path)
-    if all(not page.get_text().strip() for page in doc):
+
+    # Digital PDF
+    if any(page.get_text().strip() for page in doc):
+        return [(i + 1, page.get_text()) for i, page in enumerate(doc)]
+
+    # Scanned PDF
+    if OCR_AVAILABLE:
         return ocr_pdf(pdf_path)
 
-    pages = []
-    for i, page in enumerate(doc):
-        pages.append((i + 1, page.get_text()))
-    return pages
+    # Scanned but OCR unavailable
+    st.warning(f"OCR disabled for scanned PDF: {os.path.basename(pdf_path)}")
+    return []
 
 # ---------------- SEARCH ---------------- #
 
@@ -68,13 +109,13 @@ def boolean_match(text, query):
     q = query.lower()
 
     if " and " in q:
-        a, b = q.split(" and ")
+        a, b = q.split(" and ", 1)
         return a in text and b in text
     if " or " in q:
-        a, b = q.split(" or ")
+        a, b = q.split(" or ", 1)
         return a in text or b in text
     if " not " in q:
-        a, b = q.split(" not ")
+        a, b = q.split(" not ", 1)
         return a in text and b not in text
 
     return q in text
@@ -82,7 +123,7 @@ def boolean_match(text, query):
 def keyword_search(query):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT * FROM pdf_index")
+    cur.execute("SELECT file, page, content FROM pdf_index")
     rows = cur.fetchall()
     conn.close()
 
@@ -102,13 +143,14 @@ def semantic_search(query, top_k=5):
 
     texts = [r[2] for r in rows]
     embeddings = model.encode(texts)
+
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(np.array(embeddings))
 
     q_emb = model.encode([query])
-    _, indices = index.search(np.array(q_emb), top_k)
+    _, idx = index.search(np.array(q_emb), top_k)
 
-    return [(rows[i][0], rows[i][1]) for i in indices[0]]
+    return [(rows[i][0], rows[i][1]) for i in idx[0]]
 
 # ---------------- HIGHLIGHT ---------------- #
 
@@ -122,16 +164,21 @@ def highlight_pdf(pdf_path, term):
     doc.save(out)
     return out
 
-# ---------------- STREAMLIT UI ---------------- #
+# ---------------- UI ---------------- #
 
-st.set_page_config(page_title="Local PDF Search Engine", layout="wide")
-st.title("📄 Local PDF Search Engine")
+st.title("📄 PDF Search Engine (Streamlit-Safe)")
+
+if IS_STREAMLIT_CLOUD:
+    st.info("Running on Streamlit Cloud → OCR disabled")
+else:
+    st.success("Running locally → OCR enabled")
 
 init_db()
 
-# -------- Upload Section -------- #
+# ---------- Upload ---------- #
 
 st.header("📤 Upload PDFs")
+
 uploaded_files = st.file_uploader(
     "Upload multiple PDFs",
     type="pdf",
@@ -139,59 +186,55 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files and st.button("Index PDFs"):
-    with st.spinner("Processing PDFs..."):
+    with st.spinner("Indexing PDFs..."):
         for file in uploaded_files:
-            temp_path = file.name
-            with open(temp_path, "wb") as f:
+            with open(file.name, "wb") as f:
                 f.write(file.read())
 
-            pages = process_pdf(temp_path)
-            for page, text in pages:
-                store_page(temp_path, page, text)
+            for page, text in process_pdf(file.name):
+                store_page(file.name, page, text)
 
-    st.success("PDFs indexed successfully")
+    st.success("Indexing completed")
 
-# -------- Search Section -------- #
+# ---------- Search ---------- #
 
 st.header("🔍 Search")
+
 query = st.text_input("Enter phrase / Boolean query (AND / OR / NOT)")
 
 col1, col2 = st.columns(2)
 
-with col1:
-    if st.button("Keyword / Boolean Search"):
-        results = keyword_search(query)
-        st.session_state["results"] = results
+if col1.button("Keyword / Boolean Search"):
+    st.session_state.results = keyword_search(query)
 
-with col2:
-    if st.button("Semantic Search"):
-        results = semantic_search(query)
-        st.session_state["results"] = results
+if col2.button("Semantic Search"):
+    st.session_state.results = semantic_search(query)
 
-# -------- Results Section -------- #
+# ---------- Results ---------- #
 
 st.header("📊 Results")
 
 if "results" in st.session_state:
-    if st.session_state["results"]:
-        st.table(
-            [{"File": f, "Page": p} for f, p in st.session_state["results"]]
-        )
+    if st.session_state.results:
+        st.table([
+            {"File": f, "Page": p}
+            for f, p in st.session_state.results
+        ])
     else:
         st.warning("No results found")
 
-# -------- Highlight Section -------- #
+# ---------- Highlight ---------- #
 
-st.header("🖍️ Highlight PDF")
+st.header("🖍️ Highlight")
 
-if "results" in st.session_state and st.session_state["results"]:
-    selected = st.selectbox(
-        "Select file to highlight",
-        list(set(f for f, _ in st.session_state["results"]))
+if "results" in st.session_state and st.session_state.results:
+    selected_file = st.selectbox(
+        "Select PDF",
+        sorted(set(f for f, _ in st.session_state.results))
     )
 
     if st.button("Highlight Term"):
-        out = highlight_pdf(selected, query)
+        out = highlight_pdf(selected_file, query)
         with open(out, "rb") as f:
             st.download_button(
                 "⬇️ Download Highlighted PDF",
