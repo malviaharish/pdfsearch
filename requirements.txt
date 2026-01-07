@@ -1,0 +1,8 @@
+streamlit
+pymupdf
+pytesseract
+pdf2image
+pillow
+sentence-transformers
+faiss-cpu
+numpy
